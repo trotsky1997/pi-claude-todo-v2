@@ -6,6 +6,7 @@ This package recreates the Claude Code Todo V2 / task-list workflow as closely a
 
 Core task-list behavior:
 
+- `TodoWrite` provides a Claude-style snapshot todo frontend over the same backend task list
 - exact Claude public task tool names: `TaskCreate`, `TaskGet`, `TaskList`, `TaskUpdate`, `TaskStop`
 - project-local file-backed task lists under `.pi/claude-todo-v2/tasklists/<taskListId>/`
 - dependency tracking with `blocks` / `blockedBy`
@@ -61,11 +62,14 @@ pi -e /home/aka/pi-playground/pi-claude-todo-v2/extensions/claude-todo-v2/index.
 
 The package registers these exact tool names:
 
+- `TodoWrite`
 - `TaskCreate`
 - `TaskGet`
 - `TaskList`
 - `TaskUpdate`
 - `TaskStop`
+
+`TodoWrite` is the lightweight front-end writer: it accepts Claude Code-style `{ todos: [{ content, status, activeForm }] }` snapshots and reconciles them onto the same underlying file-backed Tasks system used by `TaskCreate` / `TaskUpdate` / `TaskList`.
 
 ## Commands
 

@@ -5,6 +5,7 @@ export const TASK_GET_TOOL_NAME = "TaskGet";
 export const TASK_LIST_TOOL_NAME = "TaskList";
 export const TASK_UPDATE_TOOL_NAME = "TaskUpdate";
 export const TASK_STOP_TOOL_NAME = "TaskStop";
+export const TODO_WRITE_TOOL_NAME = "TodoWrite";
 
 export const STATE_ENTRY = "claude-todo-v2-state";
 export const TASK_CONTEXT_CUSTOM_TYPE = "claude-todo-v2-context";
@@ -39,6 +40,27 @@ export interface TaskSummary {
   owner?: string;
   blockedBy: string[];
 }
+
+export interface TodoItem {
+  content: string;
+  status: TaskStatus;
+  activeForm: string;
+}
+
+export const TodoItemSchema = Type.Object({
+  content: Type.String({ description: "Task content in imperative form" }),
+  status: TASK_STATUS_SCHEMA,
+  activeForm: Type.String({
+    description: "Present continuous form shown while the item is in progress",
+  }),
+});
+
+export const TodoListSchema = Type.Array(TodoItemSchema);
+
+export const TodoWriteParamsSchema = Type.Object({
+  todos: TodoListSchema,
+});
+export type TodoWriteParams = Static<typeof TodoWriteParamsSchema>;
 
 export interface ClaimTaskOptions {
   checkAgentBusy?: boolean;
@@ -231,6 +253,12 @@ export interface TaskUpdateDetails {
     to: string;
   };
   taskListFollowUpNeeded?: boolean;
+  verificationNudgeNeeded?: boolean;
+}
+
+export interface TodoWriteDetails {
+  oldTodos: TodoItem[];
+  newTodos: TodoItem[];
   verificationNudgeNeeded?: boolean;
 }
 

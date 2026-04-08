@@ -1,12 +1,14 @@
 import type { Model } from "@mariozechner/pi-ai";
 import { defineTool, type ModelRegistry, type ToolDefinition } from "@mariozechner/pi-coding-agent";
 import {
+  TODO_WRITE_DESCRIPTION,
   TASK_CREATE_DESCRIPTION,
   TASK_GET_DESCRIPTION,
   TASK_LIST_DESCRIPTION,
   TASK_STOP_DESCRIPTION,
   TASK_UPDATE_DESCRIPTION,
 } from "./prompts.js";
+import { buildTodoWriteResultText, executeTodoWriteOperation } from "./todo-write-shared.js";
 import {
   createTask,
   filterExternalTasks,
@@ -22,11 +24,14 @@ import {
   executeTaskUpdateOperation,
 } from "./task-update-shared.js";
 import {
+  TODO_WRITE_TOOL_NAME,
   TASK_CREATE_TOOL_NAME,
   TASK_GET_TOOL_NAME,
   TASK_LIST_TOOL_NAME,
   TASK_STOP_TOOL_NAME,
   TASK_UPDATE_TOOL_NAME,
+  type TodoWriteParams,
+  TodoWriteParamsSchema,
   type TaskCreateParams,
   TaskCreateParamsSchema,
   type TaskGetParams,
@@ -53,6 +58,23 @@ export function buildClaudeTodoCustomTools(
   options: ClaudeTodoCustomToolOptions = {},
 ): ToolDefinition[] {
   return [
+    defineTool({
+      name: TODO_WRITE_TOOL_NAME,
+      label: TODO_WRITE_TOOL_NAME,
+      description: TODO_WRITE_DESCRIPTION,
+      parameters: TodoWriteParamsSchema,
+      async execute(_toolCallId, params: TodoWriteParams) {
+        const details = await executeTodoWriteOperation({
+          cwd,
+          taskListId,
+          todos: params.todos,
+        });
+        return {
+          content: [{ type: "text", text: buildTodoWriteResultText(details) }],
+          details,
+        };
+      },
+    }),
     defineTool({
       name: TASK_CREATE_TOOL_NAME,
       label: TASK_CREATE_TOOL_NAME,

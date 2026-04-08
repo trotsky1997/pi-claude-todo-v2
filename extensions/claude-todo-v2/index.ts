@@ -7,6 +7,8 @@ import type {
 } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import {
+  getTodoWritePromptGuidelines,
+  getTodoWritePromptSnippet,
   getTaskCreatePromptGuidelines,
   getTaskCreatePromptSnippet,
   getTaskGetPromptGuidelines,
@@ -20,6 +22,7 @@ import {
   getTaskUpdatePromptSnippet,
   TURNS_BETWEEN_REMINDERS_DEFAULT,
   TURNS_SINCE_WRITE_DEFAULT,
+  TODO_WRITE_DESCRIPTION,
   TASK_CREATE_DESCRIPTION,
   TASK_GET_DESCRIPTION,
   TASK_LIST_DESCRIPTION,
@@ -27,6 +30,7 @@ import {
   TASK_UPDATE_DESCRIPTION,
 } from "./prompts.js";
 import { loadClaudeTodoConfig, runTaskHook } from "./hooks.js";
+import { buildTodoWriteResultText, executeTodoWriteOperation } from "./todo-write-shared.js";
 import { setRecentCollabNotifier } from "./recent-collab-bridge.js";
 import { setTaskAssignmentNotifier } from "./task-assignment-bridge.js";
 import { buildTaskStopResultText, executeTaskStopOperation } from "./task-stop-shared.js";
@@ -57,6 +61,7 @@ import { TeammateLifecycleManager } from "./teammate-lifecycle.js";
 import {
   STATE_ENTRY,
   TASK_CONTEXT_CUSTOM_TYPE,
+  TODO_WRITE_TOOL_NAME,
   TASK_CREATE_TOOL_NAME,
   TASK_GET_TOOL_NAME,
   TASK_LIST_TOOL_NAME,
@@ -80,6 +85,9 @@ import {
   type TaskSummary,
   type TaskAssignmentNotification,
   type RecentCollabEvent,
+  type TodoWriteDetails,
+  type TodoWriteParams,
+  TodoWriteParamsSchema,
   type TaskUpdateDetails,
   type TaskUpdateParams,
   TaskUpdateParamsSchema,
@@ -101,6 +109,7 @@ const RECENT_EVENT_TTL_MS = 120_000;
 const HIDE_DELAY_MS = 5000;
 const FALLBACK_POLL_MS = 5000;
 const TOOL_NAMES = [
+  TODO_WRITE_TOOL_NAME,
   TASK_CREATE_TOOL_NAME,
   TASK_GET_TOOL_NAME,
   TASK_LIST_TOOL_NAME,
@@ -584,6 +593,7 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
       if (entry.type !== "message" || !entry.message) continue;
       if (entry.message.role === "toolResult") {
         if (
+          entry.message.toolName === TODO_WRITE_TOOL_NAME ||
           entry.message.toolName === TASK_CREATE_TOOL_NAME ||
           entry.message.toolName === TASK_UPDATE_TOOL_NAME
         ) {
@@ -633,6 +643,9 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
     let text = theme.fg("toolTitle", theme.bold(`${toolName} `));
     if (toolName === TASK_LIST_TOOL_NAME) {
       text += theme.fg("muted", "list tasks");
+    } else if (toolName === TODO_WRITE_TOOL_NAME) {
+      const todos = Array.isArray(args.todos) ? args.todos as Array<Record<string, unknown>> : [];
+      text += theme.fg("muted", `${todos.length} item${todos.length === 1 ? "" : "s"}`);
     } else if (toolName === TASK_GET_TOOL_NAME) {
       text += theme.fg("accent", `#${String(args.taskId ?? "?")}`);
     } else if (toolName === TASK_CREATE_TOOL_NAME) {
@@ -650,6 +663,39 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
   }
 
   function registerTools(): void {
+    pi.registerTool({
+      name: TODO_WRITE_TOOL_NAME,
+      label: TODO_WRITE_TOOL_NAME,
+      description: TODO_WRITE_DESCRIPTION,
+      promptSnippet: getTodoWritePromptSnippet(),
+      promptGuidelines: getTodoWritePromptGuidelines(),
+      parameters: TodoWriteParamsSchema,
+      async execute(_toolCallId: string, params: TodoWriteParams, _signal, _onUpdate, ctx: ExtensionContext) {
+        const taskListId = getResolvedTaskListId(ctx);
+        const details = await executeTodoWriteOperation({
+          cwd: process.cwd(),
+          taskListId,
+          todos: params.todos,
+          signal: ctx.signal,
+        });
+        await refreshUi(ctx);
+        return {
+          content: [{ type: "text", text: buildTodoWriteResultText(details) }],
+          details,
+        };
+      },
+      renderCall(args, theme) {
+        return renderToolCall(TODO_WRITE_TOOL_NAME, args as Record<string, unknown>, theme);
+      },
+      renderResult(result, _options, theme) {
+        const details = result.details as TodoWriteDetails | undefined;
+        const text = details
+          ? buildTodoWriteResultText(details)
+          : (result.content[0]?.type === "text" ? result.content[0].text : "");
+        return new Text(theme.fg("muted", text), 0, 0);
+      },
+    });
+
     pi.registerTool({
       name: TASK_CREATE_TOOL_NAME,
       label: TASK_CREATE_TOOL_NAME,

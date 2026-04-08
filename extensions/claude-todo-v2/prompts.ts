@@ -1,5 +1,6 @@
 import type { Task } from "./types.js";
 import {
+  TODO_WRITE_TOOL_NAME,
   TASK_CREATE_TOOL_NAME,
   TASK_GET_TOOL_NAME,
   TASK_LIST_TOOL_NAME,
@@ -16,6 +17,20 @@ export const TASK_GET_DESCRIPTION = "Get a task by ID from the task list";
 export const TASK_LIST_DESCRIPTION = "List all tasks in the task list";
 export const TASK_UPDATE_DESCRIPTION = "Update a task in the task list";
 export const TASK_STOP_DESCRIPTION = "Stop a running teammate-backed task or managed background run and requeue it when needed";
+export const TODO_WRITE_DESCRIPTION = "Update the todo list for the current session using a snapshot-style frontend over the shared task backend";
+
+export function getTodoWritePromptSnippet(): string {
+  return `Update the current todo checklist as a full snapshot over the shared Claude-style task list.`;
+}
+
+export function getTodoWritePromptGuidelines(): string[] {
+  return [
+    `Use ${TODO_WRITE_TOOL_NAME} when you want a simpler front-end todo writer instead of incremental ${TASK_CREATE_TOOL_NAME}/${TASK_UPDATE_TOOL_NAME} calls.`,
+    `Always send the full current todo list, not a delta. The backend task list will be reconciled to match it.`,
+    `Use imperative phrasing in content and always provide activeForm for each todo item.`,
+    `If all todos are completed, ${TODO_WRITE_TOOL_NAME} clears the current checklist from the shared task backend view.`,
+  ];
+}
 
 export function getTaskCreatePromptSnippet(): string {
   return `Create a task in the shared Claude-style task list.`;
