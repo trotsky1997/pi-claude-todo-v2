@@ -32,6 +32,6 @@
     ]
   },
   "dependencies": {
-    "pi-claude-runtime-core": "git+https://github.com/trotsky1997/pi-claude-runtime-core.git#main"
+    "pi-claude-runtime-core": "https://codeload.github.com/trotsky1997/pi-claude-runtime-core/tar.gz/refs/heads/main"
   }
 }
