@@ -142,6 +142,16 @@ Create `.pi/claude-todo-v2/config.json` to customize defaults:
 
 `workers.agentType` selects which Claude-style agent definition to use for teammate-backed workers.
 
+Global setting `task_panel` controls whether the compact `tasks:<id> open:<n>` status-bar text is shown. It is hidden by default and only appears when you explicitly enable it.
+
+Example Pi settings:
+
+```json
+{
+  "task_panel": true
+}
+```
+
 Hook commands receive JSON on stdin and can block by exiting with code `2`.
 
 Reminder behavior is intentionally lightweight: the extension emits a brief hidden activation note once per session/task-list pairing, then falls back to Claude-style reminder nudges only after enough assistant turns pass without `TaskCreate` or `TaskUpdate` activity.
