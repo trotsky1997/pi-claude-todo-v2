@@ -1,35 +1,40 @@
-import { existsSync, watch, type FSWatcher } from "node:fs";
-import { readdir } from "node:fs/promises";
+import { watch, type FSWatcher } from "node:fs";
 import type {
   ExtensionAPI,
   ExtensionCommandContext,
   ExtensionContext,
   Theme,
 } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { Box, Text } from "@mariozechner/pi-tui";
 import {
-  getTaskContextMessage,
   getTaskCreatePromptGuidelines,
   getTaskCreatePromptSnippet,
   getTaskGetPromptGuidelines,
   getTaskGetPromptSnippet,
   getTaskListPromptGuidelines,
   getTaskListPromptSnippet,
+  getTaskReminderMessage,
+  getTaskStopPromptGuidelines,
+  getTaskStopPromptSnippet,
   getTaskUpdatePromptGuidelines,
   getTaskUpdatePromptSnippet,
-  getVerificationNudge,
-  shouldAddVerificationNudge,
   TURNS_BETWEEN_REMINDERS_DEFAULT,
   TURNS_SINCE_WRITE_DEFAULT,
   TASK_CREATE_DESCRIPTION,
   TASK_GET_DESCRIPTION,
   TASK_LIST_DESCRIPTION,
+  TASK_STOP_DESCRIPTION,
   TASK_UPDATE_DESCRIPTION,
 } from "./prompts.js";
 import { loadClaudeTodoConfig, runTaskHook } from "./hooks.js";
+import { setRecentCollabNotifier } from "./recent-collab-bridge.js";
+import { setTaskAssignmentNotifier } from "./task-assignment-bridge.js";
+import { buildTaskStopResultText, executeTaskStopOperation } from "./task-stop-shared.js";
+import { buildTaskUpdateResultText, executeTaskUpdateOperation } from "./task-update-shared.js";
+import { loadClaudeSubagentActiveTeamName, loadClaudeSubagentActiveTeamNameSync } from "./claude-subagent-integration.js";
+import { buildTeammateRuntimeTools, clearClaudeTodoBridge, listLiveTeammates, listManagedTasks, registerClaudeTodoBridge } from "./subagent-runtime-integration.js";
 import {
   buildTaskSummary,
-  blockTask,
   createTask,
   deleteTask,
   filterExternalTasks,
@@ -37,7 +42,6 @@ import {
   getTask,
   listTasks,
   resetTaskList,
-  updateTask,
 } from "./tasks.js";
 import {
   ensureTaskListDir,
@@ -49,14 +53,17 @@ import {
   buildTaskWidgetLines,
   syncCompletionTimestamps,
 } from "./ui.js";
+import { TeammateLifecycleManager } from "./teammate-lifecycle.js";
 import {
   STATE_ENTRY,
   TASK_CONTEXT_CUSTOM_TYPE,
   TASK_CREATE_TOOL_NAME,
   TASK_GET_TOOL_NAME,
   TASK_LIST_TOOL_NAME,
+  TASK_STOP_TOOL_NAME,
   TASK_UPDATE_TOOL_NAME,
   type PersistedState,
+  type ManagedTaskSnapshot,
   type Task,
   type TaskCreateDetails,
   type TaskCreateParams,
@@ -67,27 +74,37 @@ import {
   type TaskListDetails,
   type TaskListParams,
   TaskListParamsSchema,
+  type TaskStopDetails,
+  type TaskStopParams,
+  TaskStopParamsSchema,
   type TaskSummary,
+  type TaskAssignmentNotification,
+  type RecentCollabEvent,
   type TaskUpdateDetails,
   type TaskUpdateParams,
   TaskUpdateParamsSchema,
   type WorkerSnapshot,
 } from "./types.js";
-import { WorkerManager, getCurrentExtensionEntryPath } from "./workers.js";
+import { WorkerManager } from "./workers.js";
+import { TaskPickupManager } from "./task-pickup.js";
 
 const STATUS_KEY = "claude-todo-v2-status";
 const WIDGET_KEY = "claude-todo-v2-widget";
 const COMMAND_NAME = "claude-tasks";
+const TASK_ASSIGNMENT_CUSTOM_TYPE = "claude-todo-v2-task-assignment";
 const DEFAULT_STATE: PersistedState = {
   panelEnabled: true,
   lastReminderAssistantTurn: undefined,
 };
+const RECENT_EVENT_LIMIT = 6;
+const RECENT_EVENT_TTL_MS = 120_000;
 const HIDE_DELAY_MS = 5000;
 const FALLBACK_POLL_MS = 5000;
 const TOOL_NAMES = [
   TASK_CREATE_TOOL_NAME,
   TASK_GET_TOOL_NAME,
   TASK_LIST_TOOL_NAME,
+  TASK_STOP_TOOL_NAME,
   TASK_UPDATE_TOOL_NAME,
 ] as const;
 
@@ -129,15 +146,84 @@ function buildTaskResultText(details: TaskCreateDetails | TaskUpdateDetails): st
   if ("task" in details && details.task) {
     return `Task #${details.task.id} created successfully: ${details.task.subject}`;
   }
-  const update = details as TaskUpdateDetails;
-  let content = `Updated task #${update.taskId} ${update.updatedFields.join(", ")}`;
-  if (update.verificationNudgeNeeded) {
-    content += `\n\n${getVerificationNudge()}`;
+  return buildTaskUpdateResultText(details as TaskUpdateDetails);
+}
+
+function renderTaskAssignmentMessage(message: any, options: { expanded?: boolean }, theme: Theme) {
+  const details = message.details as TaskAssignmentNotification | undefined;
+  if (!details) {
+    return new Text(typeof message.content === "string" ? message.content : "Task assigned", 0, 0);
   }
-  return content;
+
+  let text = theme.fg("accent", theme.bold(`Task #${details.taskId} assigned to @${details.owner}`));
+  text += `\n${theme.bold(details.subject)}`;
+  text += `\n${theme.fg("dim", `Assigned by ${details.assignedBy} in ${details.taskListId}`)}`;
+  if (options.expanded && details.description.trim()) {
+    text += `\n${theme.fg("muted", details.description)}`;
+  }
+
+  const box = new Box(1, 1, (value) => theme.bg("customMessageBg", value));
+  box.addChild(new Text(text, 0, 0));
+  return box;
+}
+
+function trimRecentEvents(events: RecentCollabEvent[], now = Date.now()): RecentCollabEvent[] {
+  return events
+    .filter((event) => {
+      const timestamp = Date.parse(event.timestamp);
+      return Number.isNaN(timestamp) ? true : now - timestamp <= RECENT_EVENT_TTL_MS;
+    })
+    .slice(0, RECENT_EVENT_LIMIT);
 }
 
 export default function claudeTodoV2(pi: ExtensionAPI): void {
+  registerClaudeTodoBridge();
+  let recentEvents: RecentCollabEvent[] = [];
+
+  const rememberRecentEvent = (event: RecentCollabEvent): void => {
+    const next = trimRecentEvents([
+      event,
+      ...recentEvents.filter((existing) => !(
+        existing.type === event.type &&
+        existing.text === event.text &&
+        existing.taskListId === event.taskListId
+      )),
+    ]);
+    recentEvents = next;
+
+    const currentTaskListId = normalizeTaskListId(lastUiContext ? getResolvedTaskListId(lastUiContext) : getResolvedTaskListId());
+    if (!currentTaskListId || currentTaskListId === event.taskListId) {
+      scheduleRefresh();
+    }
+  };
+
+  setTaskAssignmentNotifier((notification) => {
+    rememberRecentEvent({
+      type: "assignment",
+      taskListId: notification.taskListId,
+      timestamp: notification.timestamp,
+      text: `#${notification.taskId} assigned to @${notification.owner} by ${notification.assignedBy}`,
+      teammateName: notification.owner,
+      taskId: notification.taskId,
+      assignedBy: notification.assignedBy,
+    });
+    pi.sendMessage(
+      {
+        customType: TASK_ASSIGNMENT_CUSTOM_TYPE,
+        content: `Task #${notification.taskId} assigned to @${notification.owner}`,
+        display: true,
+        details: notification,
+      },
+      {
+        deliverAs: "followUp",
+      },
+    );
+  });
+
+  setRecentCollabNotifier((event) => {
+    rememberRecentEvent(event);
+  });
+
   let state: PersistedState = { ...DEFAULT_STATE };
   let lastUiContext: ExtensionContext | ExtensionCommandContext | null = null;
   let completionTimestamps = new Map<string, number>();
@@ -148,13 +234,70 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
   let hideTimer: ReturnType<typeof setTimeout> | null = null;
   let currentSessionId = "tasklist";
   let cachedConfigTaskListId: string | undefined;
+  let cachedSubagentTeamTaskListId: string | undefined;
+  const teammateLifecycleManager = new TeammateLifecycleManager(process.cwd());
+  const idleTaskPickupManager = new TaskPickupManager(process.cwd());
 
   const workerManager = new WorkerManager({
     cwd: process.cwd(),
-    extensionEntryPath: getCurrentExtensionEntryPath(),
     getTaskListId: () => getResolvedTaskListId(),
     getConfig: async () => loadClaudeTodoConfig(process.cwd()),
+    getRuntimeContext: () => lastUiContext ? {
+      modelRegistry: lastUiContext.modelRegistry,
+      currentModel: lastUiContext.model,
+    } : null,
     onChange: () => scheduleRefresh(),
+  });
+
+  pi.events.on("claude-subagent:teammates-changed", (event) => {
+    const payload = event as {
+      teamName?: unknown;
+      name?: unknown;
+      status?: unknown;
+      lastResultText?: unknown;
+      lastError?: unknown;
+    } | undefined;
+    void teammateLifecycleManager.handleRuntimeEvent(payload ?? {});
+    const teamName = typeof payload?.teamName === "string"
+      ? normalizeTaskListId(payload.teamName)
+      : undefined;
+
+    if (teamName && typeof payload?.name === "string") {
+      if (payload.status === "completed") {
+        const summary = typeof payload.lastResultText === "string" && payload.lastResultText.trim()
+          ? payload.lastResultText.trim()
+          : "finished work";
+        rememberRecentEvent({
+          type: "teammate_update",
+          taskListId: teamName,
+          timestamp: new Date().toISOString(),
+          text: `@${payload.name} ${summary}`,
+          teammateName: payload.name,
+          status: "completed",
+        });
+      } else if (payload.status === "failed" || payload.status === "interrupted") {
+        const detail = typeof payload.lastError === "string" && payload.lastError.trim()
+          ? payload.lastError.trim()
+          : payload.status;
+        rememberRecentEvent({
+          type: "teammate_update",
+          taskListId: teamName,
+          timestamp: new Date().toISOString(),
+          text: `@${payload.name} ${detail}`,
+          teammateName: payload.name,
+          status: String(payload.status),
+        });
+      }
+    }
+
+    const currentTaskListId = getResolvedTaskListId();
+    if (!teamName || teamName === currentTaskListId) {
+      scheduleRefresh();
+    }
+  });
+
+  pi.events.on("claude-subagent:managed-task-changed", () => {
+    scheduleRefresh();
   });
 
   function persistState(): void {
@@ -186,8 +329,13 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
     }
   }
 
+  async function refreshLinkedTaskListContext(cwd: string): Promise<void> {
+    cachedSubagentTeamTaskListId = normalizeTaskListId(await loadClaudeSubagentActiveTeamName(cwd));
+  }
+
   async function restoreState(ctx: ExtensionContext): Promise<void> {
     state = { ...DEFAULT_STATE };
+    recentEvents = [];
     currentSessionId = sanitizePathComponent(ctx.sessionManager.getSessionId());
     for (const entry of ctx.sessionManager.getBranch()) {
       const customEntry = entry as MessageEntry;
@@ -197,6 +345,7 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
     }
     const config = await getConfig();
     cachedConfigTaskListId = normalizeTaskListId(config.taskListId);
+    await refreshLinkedTaskListContext(process.cwd());
   }
 
   async function getConfig() {
@@ -219,6 +368,14 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
       (pi.getFlag("claude-todo-v2-config-task-list") as string | undefined) ?? cachedConfigTaskListId,
     );
     if (configTaskListId) return configTaskListId;
+
+    const liveTeamTaskListId = normalizeTaskListId(loadClaudeSubagentActiveTeamNameSync(process.cwd()));
+    if (liveTeamTaskListId) {
+      cachedSubagentTeamTaskListId = liveTeamTaskListId;
+      return liveTeamTaskListId;
+    }
+
+    if (cachedSubagentTeamTaskListId) return cachedSubagentTeamTaskListId;
 
     if (ctx) {
       return sanitizePathComponent(ctx.sessionManager.getSessionId());
@@ -278,10 +435,67 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
     watchedTaskListId = taskListId;
     await ensureTaskListDir(process.cwd(), taskListId);
     try {
-      watcher = watch(getTaskListDir(process.cwd(), taskListId), () => scheduleRefresh());
+      watcher = watch(getTaskListDir(process.cwd(), taskListId), () => {
+        scheduleRefresh();
+        void maybeAutoClaimIdleTeammates(taskListId);
+      });
       watcher.unref();
     } catch {
       watcher = null;
+    }
+  }
+
+  function getManagedTaskStatusColor(status: ManagedTaskSnapshot["status"]): keyof Theme {
+    switch (status) {
+      case "running":
+        return "accent";
+      case "completed":
+        return "success";
+      case "failed":
+        return "error";
+      case "interrupted":
+        return "warning";
+      case "idle":
+      default:
+        return "muted";
+    }
+  }
+
+  function previewManagedText(text: string | undefined, max = 42): string | undefined {
+    if (!text) return undefined;
+    const normalized = text.replace(/\s+/g, " ").trim();
+    if (!normalized) return undefined;
+    if (normalized.length <= max) return normalized;
+    return `${normalized.slice(0, Math.max(0, max - 3))}...`;
+  }
+
+  function buildManagedTaskLines(theme: Theme, managedTasks: ManagedTaskSnapshot[]): string[] {
+    if (managedTasks.length === 0) return [];
+
+    const lines = ["", theme.fg("accent", theme.bold("Managed Runs"))];
+    for (const task of managedTasks) {
+      const color = getManagedTaskStatusColor(task.status);
+      const detail = previewManagedText(task.error ?? task.resultText ?? task.description);
+      const suffix = detail ? ` - ${detail}` : "";
+      lines.push(theme.fg(color, `${task.runtimeName} [${task.taskId}]: ${task.status} (${task.agentType})${suffix}`));
+    }
+    return lines;
+  }
+
+  async function maybeAutoClaimIdleTeammates(taskListId: string): Promise<void> {
+    if (!lastUiContext) return;
+
+    const teammates = listLiveTeammates(taskListId)
+      .filter((teammate) => teammate.autoClaimTasks === true)
+      .filter((teammate) => teammate.status === "idle" || teammate.status === "completed");
+
+    for (const teammate of teammates) {
+      const claimedTask = await idleTaskPickupManager.claimNextAvailableTask({
+        taskListId,
+        ownerName: teammate.name,
+      });
+      if (!claimedTask) continue;
+      scheduleRefresh();
     }
   }
 
@@ -291,9 +505,14 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
 
     const taskListId = getResolvedTaskListId(ctx);
     await ensureWatcher(taskListId);
+    await maybeAutoClaimIdleTeammates(taskListId);
 
     const config = await getConfig();
     const tasks = filterExternalTasks(await listTasks(process.cwd(), taskListId));
+    const teammates = listLiveTeammates(taskListId);
+    const managedTasks = listManagedTasks(taskListId);
+    recentEvents = trimRecentEvents(recentEvents);
+    const relevantRecentEvents = recentEvents.filter((event) => event.taskListId === taskListId);
     syncCompletionTimestamps(tasks, completionTimestamps);
 
     if (pollTimer) {
@@ -302,7 +521,12 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
     }
 
     const hasIncomplete = tasks.some((task) => task.status !== "completed");
-    if (hasIncomplete || workerManager.list().some((worker) => worker.status === "running")) {
+    if (
+      hasIncomplete
+      || workerManager.list().some((worker) => worker.status === "running")
+      || teammates.some((teammate) => teammate.status === "running")
+      || managedTasks.some((task) => task.status === "running")
+    ) {
       pollTimer = setTimeout(() => scheduleRefresh(), FALLBACK_POLL_MS);
       pollTimer.unref?.();
     }
@@ -316,17 +540,32 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
     }
 
     const workers = workerManager.list();
-    if (!state.panelEnabled || (tasks.length === 0 && workers.length === 0)) {
+    if (!state.panelEnabled || (tasks.length === 0 && workers.length === 0 && teammates.length === 0 && managedTasks.length === 0 && relevantRecentEvents.length === 0)) {
       clearUi(ctx);
       return;
     }
 
-    ctx.ui.setStatus(STATUS_KEY, buildStatusText(ctx.ui.theme, taskListId, tasks, workers));
+    const baseStatus = buildStatusText(ctx.ui.theme, taskListId, tasks, workers, teammates);
+    const runningManaged = managedTasks.filter((task) => task.status === "running").length;
+    const statusText = managedTasks.length > 0
+      ? `${baseStatus} ${ctx.ui.theme.fg("muted", `runs:${runningManaged}/${managedTasks.length}`)}`
+      : baseStatus;
+    ctx.ui.setStatus(STATUS_KEY, statusText);
+    const widgetLines = buildTaskWidgetLines(
+      ctx.ui.theme,
+      taskListId,
+      tasks,
+      workers,
+      teammates,
+      relevantRecentEvents,
+      completionTimestamps,
+      {
+        maxItems: config.panel?.maxItems,
+      },
+    );
     ctx.ui.setWidget(
       WIDGET_KEY,
-      buildTaskWidgetLines(ctx.ui.theme, taskListId, tasks, workers, completionTimestamps, {
-        maxItems: config.panel?.maxItems,
-      }),
+      [...widgetLines, ...buildManagedTaskLines(ctx.ui.theme, managedTasks)],
       { placement: config.panel?.placement ?? "aboveEditor" },
     );
   }
@@ -381,6 +620,15 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
     return assistantTurnCount - state.lastReminderAssistantTurn >= between;
   }
 
+  function hasActiveTaskTools(): boolean {
+    const activeTools = new Set(pi.getActiveTools());
+    return TOOL_NAMES.some((name) => activeTools.has(name));
+  }
+
+  function getTaskActivationKey(taskListId: string): string {
+    return `${currentSessionId}:${taskListId}`;
+  }
+
   function renderToolCall(toolName: string, args: Record<string, unknown>, theme: Theme): Text {
     let text = theme.fg("toolTitle", theme.bold(`${toolName} `));
     if (toolName === TASK_LIST_TOOL_NAME) {
@@ -394,6 +642,9 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
       if (typeof args.status === "string") {
         text += theme.fg("muted", ` ${args.status}`);
       }
+    } else if (toolName === TASK_STOP_TOOL_NAME) {
+      text += theme.fg("accent", `#${String(args.taskId ?? "?")}`);
+      text += theme.fg("warning", " stop");
     }
     return new Text(text, 0, 0);
   }
@@ -559,156 +810,30 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
       parameters: TaskUpdateParamsSchema,
       async execute(_toolCallId: string, params: TaskUpdateParams, _signal, _onUpdate, ctx: ExtensionContext) {
         const taskListId = getResolvedTaskListId(ctx);
-        const existingTask = await getTask(process.cwd(), taskListId, params.taskId);
-        if (!existingTask) {
-          const details: TaskUpdateDetails = {
-            success: false,
-            taskId: params.taskId,
-            taskListId,
-            updatedFields: [],
-            error: "Task not found",
-          };
-          return {
-            content: [{ type: "text", text: buildTaskResultText(details) }],
-            details,
-          };
-        }
-
-        const updates: Partial<Omit<Task, "id">> = {};
-        const updatedFields: string[] = [];
-
-        if (params.subject !== undefined && params.subject !== existingTask.subject) {
-          updates.subject = params.subject;
-          updatedFields.push("subject");
-        }
-        if (params.description !== undefined && params.description !== existingTask.description) {
-          updates.description = params.description;
-          updatedFields.push("description");
-        }
-        if (params.activeForm !== undefined && params.activeForm !== existingTask.activeForm) {
-          updates.activeForm = params.activeForm;
-          updatedFields.push("activeForm");
-        }
-        if (params.owner !== undefined && params.owner !== existingTask.owner) {
-          updates.owner = params.owner;
-          updatedFields.push("owner");
-        }
-        const workerName = process.env.PI_CLAUDE_TODO_V2_WORKER_NAME?.trim();
-        if (
-          params.status === "in_progress" &&
-          params.owner === undefined &&
-          !existingTask.owner &&
-          workerName
-        ) {
-          updates.owner = workerName;
-          updatedFields.push("owner");
-        }
-        if (params.metadata !== undefined) {
-          const merged = { ...(existingTask.metadata ?? {}) };
-          for (const [key, value] of Object.entries(params.metadata)) {
-            if (value === null) {
-              delete merged[key];
-            } else {
-              merged[key] = value;
-            }
-          }
-          updates.metadata = merged;
-          updatedFields.push("metadata");
-        }
-
-        if (params.status === "deleted") {
-          const success = await deleteTask(process.cwd(), taskListId, params.taskId);
-          const details: TaskUpdateDetails = {
-            success,
-            taskId: params.taskId,
-            taskListId,
-            updatedFields: success ? ["deleted"] : [],
-            ...(success
-              ? { statusChange: { from: existingTask.status, to: "deleted" } }
-              : { error: "Failed to delete task" }),
-          };
-          await refreshUi(ctx);
-          return {
-            content: [{ type: "text", text: buildTaskResultText(details) }],
-            details,
-          };
-        }
-
-        if (params.status !== undefined && params.status !== existingTask.status) {
-          if (params.status === "completed") {
-            const config = await getConfig();
-            const hookResult = await runTaskHook(
-              process.cwd(),
-              config.hooks?.taskCompleted,
-              {
-                hook_event_name: "TaskCompleted",
-                task_id: existingTask.id,
-                task_subject: existingTask.subject,
-                task_description: existingTask.description,
-                task_list_id: taskListId,
-              },
-              ctx.signal,
-            );
-            if (hookResult.blocked) {
-              const details: TaskUpdateDetails = {
-                success: false,
-                taskId: params.taskId,
-                taskListId,
-                updatedFields: [],
-                error: `TaskCompleted hook feedback:\n${hookResult.message}`,
-              };
-              return {
-                content: [{ type: "text", text: buildTaskResultText(details) }],
-                details,
-              };
-            }
-          }
-          updates.status = params.status;
-          updatedFields.push("status");
-        }
-
-        if (Object.keys(updates).length > 0) {
-          await updateTask(process.cwd(), taskListId, params.taskId, updates);
-        }
-
-        if (params.addBlocks && params.addBlocks.length > 0) {
-          const newBlocks = params.addBlocks.filter((id) => !existingTask.blocks.includes(id));
-          for (const blockedId of newBlocks) {
-            await blockTask(process.cwd(), taskListId, params.taskId, blockedId);
-          }
-          if (newBlocks.length > 0) {
-            updatedFields.push("blocks");
-          }
-        }
-
-        if (params.addBlockedBy && params.addBlockedBy.length > 0) {
-          const newBlockedBy = params.addBlockedBy.filter((id) => !existingTask.blockedBy.includes(id));
-          for (const blockerId of newBlockedBy) {
-            await blockTask(process.cwd(), taskListId, blockerId, params.taskId);
-          }
-          if (newBlockedBy.length > 0) {
-            updatedFields.push("blockedBy");
-          }
-        }
-
-        const { tasks } = await getAllDoneState(process.cwd(), taskListId);
-        const verificationNudgeNeeded =
-          params.status === "completed" && shouldAddVerificationNudge(filterExternalTasks(tasks));
-
-        const details: TaskUpdateDetails = {
-          success: true,
-          taskId: params.taskId,
+        const details = await executeTaskUpdateOperation({
+          cwd: process.cwd(),
           taskListId,
-          updatedFields,
-          ...(updates.status !== undefined
-            ? { statusChange: { from: existingTask.status, to: updates.status } }
-            : {}),
-          verificationNudgeNeeded,
-        };
+          params,
+          signal: ctx.signal,
+          runtimeContext: {
+            modelRegistry: ctx.modelRegistry,
+            currentModel: ctx.model,
+          },
+          buildCustomTools: (actingAgentName) => buildTeammateRuntimeTools({
+            cwd: process.cwd(),
+            taskListId,
+            actingAgentName,
+            runtimeContext: {
+              modelRegistry: ctx.modelRegistry,
+              currentModel: ctx.model,
+            },
+          }),
+        });
         await refreshUi(ctx);
         return {
           content: [{ type: "text", text: buildTaskResultText(details) }],
           details,
+          ...(details.success ? {} : { isError: true }),
         };
       },
       renderCall(args, theme) {
@@ -718,6 +843,40 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
         const details = result.details as TaskUpdateDetails | undefined;
         const text = details
           ? buildTaskResultText(details)
+          : (result.content[0]?.type === "text" ? result.content[0].text : "");
+        return new Text(details?.success === false ? theme.fg("error", text) : text, 0, 0);
+      },
+    });
+
+
+    pi.registerTool({
+      name: TASK_STOP_TOOL_NAME,
+      label: TASK_STOP_TOOL_NAME,
+      description: TASK_STOP_DESCRIPTION,
+      promptSnippet: getTaskStopPromptSnippet(),
+      promptGuidelines: getTaskStopPromptGuidelines(),
+      parameters: TaskStopParamsSchema,
+      async execute(_toolCallId: string, params: TaskStopParams, _signal, _onUpdate, ctx: ExtensionContext) {
+        const taskListId = getResolvedTaskListId(ctx);
+        const details = await executeTaskStopOperation({
+          cwd: process.cwd(),
+          taskListId,
+          taskId: params.taskId,
+        });
+        await refreshUi(ctx);
+        return {
+          content: [{ type: "text", text: buildTaskStopResultText(details) }],
+          details,
+          ...(details.success ? {} : { isError: true }),
+        };
+      },
+      renderCall(args, theme) {
+        return renderToolCall(TASK_STOP_TOOL_NAME, args as Record<string, unknown>, theme);
+      },
+      renderResult(result, _options, theme) {
+        const details = result.details as TaskStopDetails | undefined;
+        const text = details
+          ? buildTaskStopResultText(details)
           : (result.content[0]?.type === "text" ? result.content[0].text : "");
         return new Text(details?.success === false ? theme.fg("error", text) : text, 0, 0);
       },
@@ -815,26 +974,25 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
       (message: { customType?: string }) => message.customType !== TASK_CONTEXT_CUSTOM_TYPE,
     );
 
-    const activeTools = new Set(pi.getActiveTools());
-    const hasTaskTools = TOOL_NAMES.some((name) => activeTools.has(name));
-    if (!hasTaskTools) {
+    if (!hasActiveTaskTools()) {
       return { messages: filteredMessages };
     }
 
-    const taskListId = getResolvedTaskListId(ctx);
-    const tasks = filterExternalTasks(await listTasks(process.cwd(), taskListId));
     const turnsSinceLastTaskManagement = getTurnsSinceLastTaskManagement(ctx);
     const assistantTurnCount = getAssistantTurnCount(ctx);
     const config = await getConfig();
     const reminder = shouldSendReminder(turnsSinceLastTaskManagement, assistantTurnCount, config);
-    if (reminder && state.lastReminderAssistantTurn !== assistantTurnCount) {
+    if (!reminder) {
+      return { messages: filteredMessages };
+    }
+
+    if (state.lastReminderAssistantTurn !== assistantTurnCount) {
       state.lastReminderAssistantTurn = assistantTurnCount;
       persistState();
     }
-    const content = getTaskContextMessage(taskListId, tasks, workerManager.list(), {
-      reminder,
-      turnsSinceLastTaskManagement,
-    });
+    const taskListId = getResolvedTaskListId(ctx);
+    const tasks = filterExternalTasks(await listTasks(process.cwd(), taskListId));
+    const content = getTaskReminderMessage(tasks, turnsSinceLastTaskManagement);
 
     filteredMessages.push({
       customType: TASK_CONTEXT_CUSTOM_TYPE,
@@ -875,25 +1033,47 @@ export default function claudeTodoV2(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", async (_event: unknown, ctx: ExtensionContext) => {
     lastUiContext = ctx;
+    await refreshLinkedTaskListContext(process.cwd());
     await refreshUi(ctx);
+
+    if (!hasActiveTaskTools()) {
+      return;
+    }
+
     const taskListId = getResolvedTaskListId(ctx);
-    const path = getTaskListDir(process.cwd(), taskListId);
-    const hasTasks = existsSync(path) && (await readdir(path).catch(() => [])).some((file) => file.endsWith(".json"));
+    const activationKey = getTaskActivationKey(taskListId);
+    if (state.lastActivationKey === activationKey) {
+      return;
+    }
+
+    state.lastActivationKey = activationKey;
+    persistState();
+
+    const taskCount = filterExternalTasks(await listTasks(process.cwd(), taskListId)).length;
     return {
       message: {
         customType: TASK_CONTEXT_CUSTOM_TYPE,
-        content: `Claude Todo V2 is active for task list ${taskListId}. ${hasTasks ? "Existing shared tasks are available." : "No tasks exist yet."}`,
+        content: taskCount > 0
+          ? `Claude Todo V2 task tools are active for task list ${taskListId}. ${taskCount} shared task(s) already exist. Use ${TASK_LIST_TOOL_NAME} when you need the queue.`
+          : `Claude Todo V2 task tools are active for task list ${taskListId}. No shared tasks exist yet.`,
         display: false,
       },
     };
   });
 
   pi.on("session_shutdown", async () => {
+    clearClaudeTodoBridge();
     watcher?.close();
     watcher = null;
     if (refreshTimer) clearTimeout(refreshTimer);
     if (pollTimer) clearTimeout(pollTimer);
     clearHideTimer();
     await workerManager.dispose();
+    setRecentCollabNotifier(null);
+    setTaskAssignmentNotifier(null);
   });
+
+  pi.registerMessageRenderer(TASK_ASSIGNMENT_CUSTOM_TYPE, (message, options, theme) =>
+    renderTaskAssignmentMessage(message, options, theme),
+  );
 }

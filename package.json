@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "description": "Claude Code Todo V2-style task system for Pi.",
   "type": "module",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/trotsky1997/pi-claude-todo-v2.git"
@@ -12,12 +14,24 @@
   "bugs": {
     "url": "https://github.com/trotsky1997/pi-claude-todo-v2/issues"
   },
+  "exports": {
+    "./task-tools-bridge": "./extensions/claude-todo-v2/task-tools-bridge.ts",
+    "./tasks": "./extensions/claude-todo-v2/tasks.ts",
+    "./prompts": "./extensions/claude-todo-v2/prompts.ts",
+    "./storage": "./extensions/claude-todo-v2/storage.ts",
+    "./types": "./extensions/claude-todo-v2/types.ts"
+  },
   "peerDependencies": {
     "@mariozechner/pi-coding-agent": "*",
     "@mariozechner/pi-tui": "*",
     "@sinclair/typebox": "*"
   },
   "pi": {
-    "extensions": ["./extensions/claude-todo-v2"]
+    "extensions": [
+      "./extensions/claude-todo-v2"
+    ]
+  },
+  "dependencies": {
+    "pi-claude-runtime-core": "git+https://github.com/trotsky1997/pi-claude-runtime-core.git#main"
   }
 }

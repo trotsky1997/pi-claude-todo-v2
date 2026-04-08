@@ -4,6 +4,7 @@ export const TASK_CREATE_TOOL_NAME = "TaskCreate";
 export const TASK_GET_TOOL_NAME = "TaskGet";
 export const TASK_LIST_TOOL_NAME = "TaskList";
 export const TASK_UPDATE_TOOL_NAME = "TaskUpdate";
+export const TASK_STOP_TOOL_NAME = "TaskStop";
 
 export const STATE_ENTRY = "claude-todo-v2-state";
 export const TASK_CONTEXT_CUSTOM_TYPE = "claude-todo-v2-context";
@@ -56,6 +57,11 @@ export interface ClaimTaskResult {
   blockedByTasks?: string[];
 }
 
+export const TaskStopParamsSchema = Type.Object({
+  taskId: Type.String({ description: "The ID of the running task to stop" }),
+});
+export type TaskStopParams = Static<typeof TaskStopParamsSchema>;
+
 export interface WorkerSnapshot {
   name: string;
   status: "idle" | "running" | "stopping" | "stopped" | "error";
@@ -66,10 +72,35 @@ export interface WorkerSnapshot {
   lastExitCode?: number;
 }
 
+export interface TeammateSnapshot {
+  name: string;
+  agentType: string;
+  status: "idle" | "running" | "completed" | "failed" | "interrupted";
+  color?: string;
+  autoClaimTasks?: boolean;
+  lastDescription?: string;
+  lastResultText?: string;
+  lastError?: string;
+}
+
+export interface ManagedTaskSnapshot {
+  taskId: string;
+  runtimeName: string;
+  runtimeKind: "subagent" | "teammate";
+  status: "idle" | "running" | "completed" | "failed" | "interrupted";
+  agentType: string;
+  teamName?: string;
+  description?: string;
+  resultText?: string;
+  error?: string;
+  background: boolean;
+}
+
 export interface PersistedState {
   panelEnabled: boolean;
   taskListIdOverride?: string;
   lastReminderAssistantTurn?: number;
+  lastActivationKey?: string;
 }
 
 export interface HookCommandConfig {
@@ -90,9 +121,11 @@ export interface ClaudeTodoConfig {
   hooks?: {
     taskCreated?: HookCommandConfig;
     taskCompleted?: HookCommandConfig;
+    teammateIdle?: HookCommandConfig;
   };
   workers?: {
     model?: string;
+    agentType?: string;
     tools?: string[];
     pollMs?: number;
   };
@@ -178,6 +211,15 @@ export interface TaskListDetails {
   tasks: TaskSummary[];
 }
 
+export interface TaskStopDetails {
+  success: boolean;
+  taskId: string;
+  taskListId: string;
+  owner?: string;
+  error?: string;
+  runtimeStopRequested?: boolean;
+}
+
 export interface TaskUpdateDetails {
   success: boolean;
   taskId: string;
@@ -188,5 +230,27 @@ export interface TaskUpdateDetails {
     from: string;
     to: string;
   };
+  taskListFollowUpNeeded?: boolean;
   verificationNudgeNeeded?: boolean;
+}
+
+export interface TaskAssignmentNotification {
+  taskId: string;
+  taskListId: string;
+  subject: string;
+  description: string;
+  owner: string;
+  assignedBy: string;
+  timestamp: string;
+}
+
+export interface RecentCollabEvent {
+  type: "assignment" | "completion" | "stop" | "teammate_update";
+  taskListId: string;
+  timestamp: string;
+  text: string;
+  teammateName?: string;
+  taskId?: string;
+  assignedBy?: string;
+  status?: string;
 }

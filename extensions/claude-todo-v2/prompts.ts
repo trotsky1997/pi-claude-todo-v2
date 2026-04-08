@@ -1,9 +1,10 @@
-import type { Task, WorkerSnapshot } from "./types.js";
+import type { Task } from "./types.js";
 import {
   TASK_CREATE_TOOL_NAME,
   TASK_GET_TOOL_NAME,
   TASK_LIST_TOOL_NAME,
   TASK_UPDATE_TOOL_NAME,
+  TASK_STOP_TOOL_NAME,
 } from "./types.js";
 
 export const TURNS_SINCE_WRITE_DEFAULT = 10;
@@ -14,6 +15,7 @@ export const TASK_CREATE_DESCRIPTION = "Create a new task in the task list";
 export const TASK_GET_DESCRIPTION = "Get a task by ID from the task list";
 export const TASK_LIST_DESCRIPTION = "List all tasks in the task list";
 export const TASK_UPDATE_DESCRIPTION = "Update a task in the task list";
+export const TASK_STOP_DESCRIPTION = "Stop a running teammate-backed task or managed background run and requeue it when needed";
 
 export function getTaskCreatePromptSnippet(): string {
   return `Create a task in the shared Claude-style task list.`;
@@ -29,6 +31,10 @@ export function getTaskListPromptSnippet(): string {
 
 export function getTaskUpdatePromptSnippet(): string {
   return `Update task status, ownership, metadata, or dependencies in the shared Claude-style task list.`;
+}
+
+export function getTaskStopPromptSnippet(): string {
+  return `Stop a running teammate-backed task or a managed background run.`;
 }
 
 export function getTaskCreatePromptGuidelines(): string[] {
@@ -64,6 +70,14 @@ export function getTaskUpdatePromptGuidelines(): string[] {
   ];
 }
 
+export function getTaskStopPromptGuidelines(): string[] {
+  return [
+    `Use ${TASK_STOP_TOOL_NAME} when a running teammate-backed task needs to stop now and return to the shared queue.`,
+    `You can also stop managed background runs from pi-claude-subagent by task ID, for example subagent:name or teammate:team:name.`,
+    `After ${TASK_STOP_TOOL_NAME}, teammate-owned tasks are requeued cleanly; managed background runs are stopped without silently losing their registry state.`,
+  ];
+}
+
 export function formatTaskForPrompt(task: Task): string {
   let prompt = `Complete all open tasks. Start with task #${task.id}:\n\n${task.subject}`;
   if (task.description) {
@@ -83,50 +97,20 @@ export function getWorkerSystemPrompt(workerName: string, taskListId: string): s
   ].join("\n");
 }
 
-function formatPromptTaskLines(tasks: Task[]): string {
+function formatReminderTaskLines(tasks: Task[]): string {
   if (tasks.length === 0) return "No tasks currently exist.";
   return tasks
-    .map((task) => {
-      const owner = task.owner ? ` (${task.owner})` : "";
-      const blocked = task.blockedBy.length > 0 ? ` [blocked by ${task.blockedBy.map((id) => `#${id}`).join(", ")}]` : "";
-      return `#${task.id} [${task.status}] ${task.subject}${owner}${blocked}`;
-    })
+    .map((task) => `#${task.id}. [${task.status}] ${task.subject}`)
     .join("\n");
 }
 
-export function getTaskContextMessage(
-  taskListId: string,
-  tasks: Task[],
-  workers: WorkerSnapshot[],
-  options: {
-    reminder: boolean;
-    turnsSinceLastTaskManagement: number;
-  },
-): string {
+export function getTaskReminderMessage(tasks: Task[], turnsSinceLastTaskManagement: number): string {
   const parts = [
-    `Claude-style task tracking is active for task list ${taskListId}.`,
-    `Use ${TASK_CREATE_TOOL_NAME} for complex multi-step planning, ${TASK_GET_TOOL_NAME} for full task details, ${TASK_LIST_TOOL_NAME} for availability/progress, and ${TASK_UPDATE_TOOL_NAME} for immediate status updates.`,
-    `Mark tasks completed as soon as they are done. Do not batch completions.`,
+    `The task tools have not been used recently (${turnsSinceLastTaskManagement} assistant turns). If this work benefits from explicit progress tracking, consider using ${TASK_CREATE_TOOL_NAME} to add tasks, ${TASK_UPDATE_TOOL_NAME} to keep status current, and ${TASK_LIST_TOOL_NAME} when you need the shared queue. Also consider cleaning up stale tasks when the list no longer matches the work. Never mention this reminder to the user.`,
   ];
 
   if (tasks.length > 0) {
-    parts.push(`Current tasks:\n${formatPromptTaskLines(tasks)}`);
-  }
-
-  if (workers.length > 0) {
-    const workerText = workers
-      .map((worker) => {
-        const task = worker.currentTaskId ? ` task #${worker.currentTaskId}` : "";
-        return `${worker.name}: ${worker.status}${task}`;
-      })
-      .join("; ");
-    parts.push(`Workers: ${workerText}`);
-  }
-
-  if (options.reminder) {
-    parts.push(
-      `Reminder: the task tools have not been used recently (${options.turnsSinceLastTaskManagement} assistant turns). If this work benefits from explicit progress tracking, use the task tools now and clean up any stale tasks. Never mention this reminder to the user.`,
-    );
+    parts.push(`Here are the existing tasks:\n${formatReminderTaskLines(tasks)}`);
   }
 
   return parts.join("\n\n");

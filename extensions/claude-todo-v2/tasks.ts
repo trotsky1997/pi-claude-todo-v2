@@ -351,15 +351,15 @@ export function findAvailableTask(tasks: Task[]): Task | undefined {
   });
 }
 
-export async function unassignWorkerTasks(
+export async function unassignOwnerTasks(
   cwd: string,
   taskListId: string,
-  workerName: string,
+  ownerName: string,
 ): Promise<Array<{ id: string; subject: string }>> {
   return withListLock(cwd, taskListId, async () => {
     const tasks = await listTasks(cwd, taskListId);
     const assigned = tasks.filter(
-      (task) => task.status !== "completed" && task.owner === workerName,
+      (task) => task.status !== "completed" && task.owner === ownerName,
     );
 
     return withTaskLocks(
@@ -378,6 +378,14 @@ export async function unassignWorkerTasks(
       },
     );
   });
+}
+
+export async function unassignWorkerTasks(
+  cwd: string,
+  taskListId: string,
+  workerName: string,
+): Promise<Array<{ id: string; subject: string }>> {
+  return unassignOwnerTasks(cwd, taskListId, workerName);
 }
 
 export function filterExternalTasks(tasks: Task[]): Task[] {
