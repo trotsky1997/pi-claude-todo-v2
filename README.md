@@ -31,17 +31,23 @@ Claude-style local coordination integration when used together with `pi-claude-s
 
 ## Install
 
+Install into the current project from GitHub:
+
+```bash
+pi install -l git:github.com/trotsky1997/pi-claude-todo-v2
+```
+
+Install globally into Pi:
+
+```bash
+pi install git:github.com/trotsky1997/pi-claude-todo-v2
+```
+
 Local install from this workspace:
 
 ```bash
 pi install -l /home/aka/pi-playground/pi-claude-todo-v2
 pi install -l /home/aka/pi-playground/pi-claude-subagent
-```
-
-Install directly from GitHub:
-
-```bash
-pi install git:github.com/trotsky1997/pi-claude-todo-v2
 ```
 
 Quick load without installing:
